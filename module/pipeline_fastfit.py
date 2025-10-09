@@ -146,8 +146,14 @@ class FastFitPipeline:
         mask = prepare_mask_image(mask_img, self.device, self.weight_dtype)
         ref_images = [prepare_image(image, self.device, self.weight_dtype) for image in ref_images]
         if pose is not None:
-            pose = pose.resize((person_img.size[0], person_img.size[1]))
             pose = prepare_image(pose, self.device, self.weight_dtype, do_normalize=False)
+            if pose.shape[-2:] != (person_img.size[1], person_img.size[0]):
+                pose = torch.nn.functional.interpolate(
+                    pose.unsqueeze(0),
+                    size=(person_img.size[1], person_img.size[0]),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
         masked_person = person * (1 - mask) + mask * pose if pose is not None else person * (1 - mask)
         
         if ref_attention_masks is not None:
