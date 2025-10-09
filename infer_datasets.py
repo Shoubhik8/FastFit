@@ -11,11 +11,103 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.transforms.transforms import F
 from tqdm import tqdm
+from huggingface_hub import snapshot_download
 
 from module.pipeline_fastfit import FastFitPipeline
 from parse_utils.automasker import cloth_agnostic_mask, multi_ref_cloth_agnostic_mask
+from parse_utils import DWposeDetector
 
 # --- Helper Function ---
+
+
+class PreprocessingChecker:
+    """检查并生成缺失的dwpose预处理文件"""
+    
+    def __init__(self, util_model_path: str = "Models/Human-Toolkit", device: str = None):
+        self.device = device if device is not None else "cuda" if torch.cuda.is_available() else "cpu"
+        self.util_model_path = util_model_path
+        
+        # 下载模型如果不存在
+        if not os.path.exists(util_model_path):
+            os.makedirs(util_model_path, exist_ok=True)
+            snapshot_download(
+                repo_id="zhengchong/Human-Toolkit",
+                local_dir=util_model_path,
+                local_dir_use_symlinks=False
+            )
+        
+        # 初始化dwpose检测器
+        self.dwpose_detector = DWposeDetector(
+            pretrained_model_name_or_path=os.path.join(util_model_path, "DWPose"), 
+            device='cpu'
+        )
+    
+    def check_and_generate_dwpose(self, person_path: Path, dwpose_path: Path) -> bool:
+        """检查并生成dwpose文件"""
+        if dwpose_path.exists():
+            return True
+        
+        try:
+            # 确保输出目录存在
+            dwpose_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 加载人物图像
+            person_img = Image.open(person_path).convert("RGB")
+            
+            # 生成dwpose
+            dwpose_img = self.dwpose_detector(person_img)
+            if isinstance(dwpose_img, Image.Image):
+                dwpose_img.save(dwpose_path)
+                return True
+            else:
+                print(f"Failed to generate dwpose for {person_path}")
+                return False
+        except Exception as e:
+            print(f"Error generating dwpose for {person_path}: {e}")
+            return False
+    
+    def check_all_dwpose_files(self, data_list: list, data_dir: str) -> None:
+        """检查并生成所有缺失的dwpose文件"""
+        print("Checking dwpose files...")
+        missing_count = 0
+        total_count = 0
+        
+        for sample in tqdm(data_list, desc="Checking dwpose files"):
+            root = Path(data_dir)
+            person_path = root / sample["person"]
+            
+            # 根据数据集类型确定dwpose文件路径
+            if "annotations" in sample["person"]:
+                # DressCode-MR数据集
+                dwpose_file = (
+                    sample["person"].replace("person", "annotations/dwpose").rsplit(".", 1)[0]
+                    + ".png"
+                )
+            elif "person" in sample["person"]:
+                # DressCode数据集
+                dwpose_file = (
+                    sample["person"].replace("person", "dwpose").rsplit(".", 1)[0] + ".png"
+                )
+            elif "image" in sample["person"]:
+                # VitonHD数据集
+                dwpose_file = (
+                    sample["person"].replace("image", "dwpose").rsplit(".", 1)[0] + ".png"
+                )
+            else:
+                continue
+            
+            dwpose_path = root / dwpose_file
+            total_count += 1
+            
+            if not dwpose_path.exists():
+                missing_count += 1
+                success = self.check_and_generate_dwpose(person_path, dwpose_path)
+                if success:
+                    print(f"Generated dwpose: {dwpose_path}")
+                else:
+                    print(f"Failed to generate dwpose: {dwpose_path}")
+        
+        print(f"Dwpose check completed. Total: {total_count}, Missing: {missing_count}")
 
 
 def center_crop_max_area_by_aspect_ratio(
@@ -65,11 +157,16 @@ class DressCodeMRDataset(Dataset):
         data_dir (str): The root directory of the dataset.
         output_dir (str): The output directory to check for existing results.
         paired (bool): Whether to use paired or unpaired data.
+        util_model_path (str): Path to utility models for preprocessing.
+        check_preprocessing (bool): Whether to check and generate missing preprocessing files.
     """
 
-    def __init__(self, data_dir: str, output_dir: str = None, paired: bool = True):
+    def __init__(self, data_dir: str, output_dir: str = None, paired: bool = True, 
+                 util_model_path: str = "Models/Human-Toolkit", check_preprocessing: bool = True):
         self.data_dir = data_dir
         self.output_dir = output_dir
+        self.util_model_path = util_model_path
+        self.check_preprocessing = check_preprocessing
         self.transform = transforms.Compose(
             [transforms.ToTensor(), transforms.Normalize(mean=[0.5], std=[0.5])]
         )
@@ -84,7 +181,7 @@ class DressCodeMRDataset(Dataset):
             4,
         ]  # 0: upper, 1: lower, 2: overall, 3: shoe, 4: bag
         self.ref_resolution = (512, 384)
-
+        
         # Load the data
         self.data = []
         data_jsonl = os.path.join(
@@ -120,6 +217,11 @@ class DressCodeMRDataset(Dataset):
                         "references": references,
                     }
                 )
+        
+        # 在数据加载完成后进行预处理检查
+        if self.check_preprocessing:
+            preprocessing_checker = PreprocessingChecker(util_model_path)
+            preprocessing_checker.check_all_dwpose_files(self.data, self.data_dir)
 
     def _load_image(
         self,
@@ -260,9 +362,12 @@ class DressCodeMRDataset(Dataset):
 
 
 class DressCodeDataset(DressCodeMRDataset):
-    def __init__(self, data_dir: str, output_dir: str = None, paired: bool = True):
+    def __init__(self, data_dir: str, output_dir: str = None, paired: bool = True, 
+                 util_model_path: str = "Models/Human-Toolkit", check_preprocessing: bool = True):
         self.data_dir = data_dir
         self.output_dir = output_dir
+        self.util_model_path = util_model_path
+        self.check_preprocessing = check_preprocessing
         self.transform = transforms.Compose(
             [transforms.ToTensor(), transforms.Normalize(mean=[0.5], std=[0.5])]
         )
@@ -270,6 +375,7 @@ class DressCodeDataset(DressCodeMRDataset):
         self.size = (1024, 768)
         self.ref_resolution = (1024, 768)
         self.ref_labels = {"upper": 0, "lower": 1, "overall": 2}
+        
         # Load the data
         self.data = []
         data_txt = os.path.join(self.data_dir, "test_pairs_unpaired.txt")
@@ -300,6 +406,11 @@ class DressCodeDataset(DressCodeMRDataset):
                         "category": self.ref_labels[category],
                     }
                 )
+        
+        # 在数据加载完成后进行预处理检查
+        if self.check_preprocessing:
+            preprocessing_checker = PreprocessingChecker(util_model_path)
+            preprocessing_checker.check_all_dwpose_files(self.data, self.data_dir)
 
     def __len__(self):
         return len(self.data)
@@ -348,15 +459,18 @@ class DressCodeDataset(DressCodeMRDataset):
 
 
 class VitonHDDataset(DressCodeMRDataset):
-    def __init__(self, data_dir: str, output_dir: str = None, paired: bool = True):
+    def __init__(self, data_dir: str, output_dir: str = None, paired: bool = True, 
+                 util_model_path: str = "Models/Human-Toolkit", check_preprocessing: bool = True):
         self.data_dir = data_dir
         self.output_dir = output_dir
+        self.util_model_path = util_model_path
+        self.check_preprocessing = check_preprocessing
         self.transform = transforms.Compose(
             [transforms.ToTensor(), transforms.Normalize(mean=[0.5], std=[0.5])]
         )
         self.size = (1024, 768)
         self.ref_resolution = (1024, 768)
-
+        
         # Load the data
         self.data = []
         data_txt = os.path.join(
@@ -384,6 +498,11 @@ class VitonHDDataset(DressCodeMRDataset):
                         "cloth": os.path.join("test", "cloth", cloth),
                     }
                 )
+        
+        # 在数据加载完成后进行预处理检查
+        if self.check_preprocessing:
+            preprocessing_checker = PreprocessingChecker(util_model_path)
+            preprocessing_checker.check_all_dwpose_files(self.data, self.data_dir)
 
     def __getitem__(self, idx):
         sample = self.data[idx]
@@ -451,6 +570,9 @@ def parse_args():
         "--mixed_precision", type=str, default="bf16", choices=["fp16", "bf16", "fp32"]
     )
     parser.add_argument("--show_skipped", action="store_true", help="Show information about skipped images")
+    parser.add_argument("--util_model_path", type=str, default="Models/Human-Toolkit", help="Path to utility models for preprocessing")
+    parser.add_argument("--check_preprocessing", action="store_true", default=True, help="Check and generate missing preprocessing files")
+    parser.add_argument("--no_check_preprocessing", action="store_true", help="Disable preprocessing check")
     return parser.parse_args()
 
 
@@ -493,22 +615,47 @@ def main():
     print(f"Output directory: {args.output_dir}")
     print(f"Existing outputs: {existing_count} images")
     
+    # 处理预处理检查参数
+    check_preprocessing = args.check_preprocessing and not args.no_check_preprocessing
+    if check_preprocessing:
+        print(f"Preprocessing check enabled. Utility models path: {args.util_model_path}")
+    else:
+        print("Preprocessing check disabled.")
+    
     if args.dataset == "dresscode-mr":
-        dataset = DressCodeMRDataset(args.data_dir, output_dir=args.output_dir, paired=args.paired)
+        dataset = DressCodeMRDataset(
+            args.data_dir, 
+            output_dir=args.output_dir, 
+            paired=args.paired,
+            util_model_path=args.util_model_path,
+            check_preprocessing=check_preprocessing
+        )
         pipeline = FastFitPipeline(
             base_model_path="zhengchong/FastFit-MR-1024",
             mixed_precision=args.mixed_precision,
             allow_tf32=True,
         )
     elif args.dataset == "dresscode":
-        dataset = DressCodeDataset(args.data_dir, output_dir=args.output_dir, paired=args.paired)
+        dataset = DressCodeDataset(
+            args.data_dir, 
+            output_dir=args.output_dir, 
+            paired=args.paired,
+            util_model_path=args.util_model_path,
+            check_preprocessing=check_preprocessing
+        )
         pipeline = FastFitPipeline(
             base_model_path="zhengchong/FastFit-SR-1024",
             mixed_precision=args.mixed_precision,
             allow_tf32=True,
         )
     elif args.dataset == "viton-hd":
-        dataset = VitonHDDataset(args.data_dir, output_dir=args.output_dir, paired=args.paired)
+        dataset = VitonHDDataset(
+            args.data_dir, 
+            output_dir=args.output_dir, 
+            paired=args.paired,
+            util_model_path=args.util_model_path,
+            check_preprocessing=check_preprocessing
+        )
         pipeline = FastFitPipeline(
             base_model_path="zhengchong/FastFit-SR-1024",
             mixed_precision=args.mixed_precision,
