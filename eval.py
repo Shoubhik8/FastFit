@@ -1,4 +1,4 @@
-# Copied from https://github.com/Zheng-Chong/CatVTON/blob/edited/eval.py
+# Modified from https://github.com/Zheng-Chong/CatVTON/blob/edited/eval.py
 import os
 import torch
 from cleanfid import fid as FID
@@ -8,6 +8,7 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchvision import transforms
 from tqdm import tqdm
+from DISTS_pytorch import DISTS
 
 from module.utils import scan_files_in_dir
 from prettytable import PrettyTable
@@ -106,6 +107,26 @@ def lpips(dataloader):
     return score / len(dataloader.dataset)
 
 
+@torch.no_grad()
+def dists(dataloader):
+    D = DISTS().to("cuda")
+    score = 0
+    for gt, pred in tqdm(dataloader, desc="Calculating DISTS"):
+        batch_size = gt.size(0)
+        pred = pred.to("cuda")
+        gt = gt.to("cuda")
+        # DISTS expects images in [0, 1] range, which matches ToTensor output
+        dists_value = D(pred, gt)
+        # DISTS returns a tensor - sum over batch dimension if it's a vector
+        if dists_value.dim() > 0:
+            # If it's a vector (batch_size,), sum all elements
+            score += dists_value.sum().item()
+        else:
+            # If it's a scalar, multiply by batch_size
+            score += dists_value.item() * batch_size
+    return score / len(dataloader.dataset)
+
+
 def eval(args):
     # Check gt_folder has images with target height, resize if not
     pred_sample = os.listdir(args.pred_folder)[0]
@@ -127,24 +148,47 @@ def eval(args):
     # Calculate Metrics
     header = []
     row = []
+    results_dict = {}
+    # FID and KID are disabled for now
     header = ["FID", "KID"]
     fid_ = FID.compute_fid(args.gt_folder, args.pred_folder)
     kid_ = FID.compute_kid(args.gt_folder, args.pred_folder) * 1000
     row = [fid_, kid_]
     if args.paired:
-        header += ["SSIM", "LPIPS"]
-        ssim_ = ssim(dataloader).item()
-        lpips_ = lpips(dataloader).item()
-        row += [ssim_, lpips_]
-    
+        header += ["SSIM", "LPIPS", "DISTS"]
+        ssim_ = ssim(dataloader)
+        lpips_ = lpips(dataloader)
+        dists_ = dists(dataloader)
+        row += [ssim_, lpips_, dists_]
+
+
     # Print Results
     print("GT Folder  : ", args.gt_folder)
     print("Pred Folder: ", args.pred_folder)
-    table = PrettyTable()
-    table.field_names = header
-    table.add_row(row)
-    print(table)
+    if header and row:  # Only create table if we have both header and row
+        table = PrettyTable()
+        table.field_names = header
+        table.add_row(row)
+        print(table)
+    else:
+        print("No metrics to display (FID/KID disabled, paired metrics only available with --paired flag)")
     
+    # Save results to CSV if specified
+    if args.results_csv and results_dict:
+        import csv
+        file_exists = os.path.exists(args.results_csv)
+        with open(args.results_csv, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                # Write header
+                writer.writerow(["Method", "Dataset", "Setting"] + list(results_dict.keys()))
+            # Extract method name from pred_folder path
+            method = os.path.basename(os.path.dirname(os.path.dirname(args.pred_folder)))
+            dataset = os.path.basename(os.path.dirname(args.pred_folder))
+            setting = os.path.basename(args.pred_folder)
+            writer.writerow([method, dataset, setting] + [results_dict.get(h, "") for h in results_dict.keys()])
+    
+    return results_dict
          
 if __name__ == "__main__":
     import argparse
@@ -154,6 +198,7 @@ if __name__ == "__main__":
     parser.add_argument("--paired", action="store_true")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--results_csv", type=str, default=None, help="CSV file to save results")
     args = parser.parse_args()
     
     eval(args)

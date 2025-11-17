@@ -15,4 +15,9 @@ pillow
 onnxruntime
 omegaconf
 einops
+dists-pytorch
 matplotlib
+clean-fid
+torchmetrics
+tqdm
+prettytable
