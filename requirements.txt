@@ -1,7 +1,10 @@
 torch
 torchvision
-diffusers 
-transformers 
+# Pinned for compatibility with torch 2.4.x: newer transformers (5.x) and
+# diffusers (>=0.35) import APIs that don't exist / aren't parseable on torch 2.4
+# (torch.distributed.tensor.device_mesh, _custom_op PEP-604 signatures).
+diffusers==0.32.2
+transformers==4.49.0
 gradio
 accelerate
 opencv-python

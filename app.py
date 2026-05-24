@@ -9,7 +9,7 @@ from huggingface_hub import snapshot_download
 
 # Assume these modules are in the same directory or properly installed
 from module.pipeline_fastfit import FastFitPipeline
-from parse_utils import DWposeDetector, DensePose, SCHP, multi_ref_cloth_agnostic_mask
+from parse_utils import DWposeDetector, DensePose, SCHP, multi_ref_cloth_agnostic_mask, cloth_agnostic_mask
 
 PERSON_SIZE = (768, 1024)
 
@@ -253,8 +253,17 @@ class FastFitDemo:
         
         return pose_img, densepose_arr, lip_arr, atr_arr
     
-    def generate_mask(self, densepose_arr: np.ndarray, lip_arr: np.ndarray, atr_arr: np.ndarray, 
-                     square_cloth_mask: bool = False) -> Image.Image:
+    def generate_mask(self, densepose_arr: np.ndarray, lip_arr: np.ndarray, atr_arr: np.ndarray,
+                     square_cloth_mask: bool = False, mask_part: Optional[str] = None) -> Image.Image:
+        # When a single garment region is targeted (e.g. "upper" for a t-shirt only),
+        # mask just that region so the rest of the person is preserved. Falling back to
+        # the multi-ref mask erases the entire outfit and would hallucinate unreferenced parts.
+        if mask_part is not None:
+            return cloth_agnostic_mask(
+                densepose_arr, lip_arr, atr_arr,
+                part=mask_part,
+                square_cloth_mask=square_cloth_mask,
+            )
         return multi_ref_cloth_agnostic_mask(
             densepose_arr, lip_arr, atr_arr,
             square_cloth_mask=square_cloth_mask,
@@ -289,7 +298,8 @@ class FastFitDemo:
     def generate_image(
         self, person_img, upper_img, lower_img, dress_img, shoe_img, bag_img,
         ref_height: int, num_inference_steps: int = 50, guidance_scale: float = 2.5,
-        use_square_mask: bool = False, seed: int = 42, enable_pose: bool = True
+        use_square_mask: bool = False, seed: int = 42, enable_pose: bool = True,
+        mask_part: Optional[str] = None
     ) -> Tuple[Optional[Image.Image], str]:
         
         try:
@@ -313,7 +323,7 @@ class FastFitDemo:
             
             # MODIFIED: Since gr.Image is used, there is no user-drawn mask.
             # We always generate the mask automatically.
-            mask_img = self.generate_mask(densepose_arr, lip_arr, atr_arr, use_square_mask)
+            mask_img = self.generate_mask(densepose_arr, lip_arr, atr_arr, use_square_mask, mask_part)
             
             ref_images, ref_labels, ref_attention_masks = self.prepare_reference_images(
                 upper_img, lower_img, dress_img, shoe_img, bag_img, ref_height

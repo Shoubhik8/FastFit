@@ -30,6 +30,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance-scale", type=float, default=2.5, help="Classifier-free guidance scale.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--square-mask", action="store_true", help="Use a square cloth-agnostic mask.")
+    parser.add_argument("--mask-part", choices=["upper", "lower", "overall", "inner", "outer"], default=None,
+                        help="Mask only this garment region instead of the whole outfit. Use 'upper' for a "
+                             "t-shirt-only try-on so the rest of the person is preserved. Defaults to masking "
+                             "the entire outfit (multi-garment).")
     parser.add_argument("--no-pose", action="store_true", help="Disable pose guidance.")
 
     parser.add_argument("--base-model-path", default="Models/FastFit-MR-1024",
@@ -64,6 +68,7 @@ def main() -> None:
         use_square_mask=args.square_mask,
         seed=args.seed,
         enable_pose=not args.no_pose,
+        mask_part=args.mask_part,
     )
 
     if result_img is None:
