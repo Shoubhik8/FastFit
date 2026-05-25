@@ -17,6 +17,8 @@ them) it runs the four detectors and writes, per person:
         densepose.npy    # uint8 HxW parse index map
         lip.npy
         atr.npy
+        masked_person_latent_square_pose.pt  # VAE latent (1,4,128,96), bf16 CPU
+        mask_latent_square.pt                # mask latent  (1,1,128,96), bf16 CPU
       masks/
         <stem>/
           multiref.png  multiref_square.png
@@ -26,8 +28,11 @@ them) it runs the four detectors and writes, per person:
           inner.png     inner_square.png
           outer.png     outer_square.png
 
-It deliberately instantiates only the four detectors (mirroring
-FastFitDemo.__init__) and never loads the heavy FastFitPipeline.
+It instantiates the four detectors plus the VAE (mirroring the person-side of
+FastFitDemo.__init__) and never loads the heavy UNet / FastFitPipeline. The two
+.pt latents are the exact tensors that get channel-concatenated onto the noisy
+latents at inference (pipeline_fastfit.py), computed here for the pose=True,
+square_cloth_mask=True configuration.
 """
 
 import argparse
@@ -37,10 +42,12 @@ from typing import List
 
 import numpy as np
 import torch
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from huggingface_hub import snapshot_download
 from PIL import Image
 
 from app import PERSON_SIZE, center_crop_to_aspect_ratio
+from module.utils import prepare_image, prepare_mask_image
 from parse_utils import (
     DWposeDetector,
     DensePose,
@@ -60,7 +67,13 @@ MASK_PARTS = ["upper", "lower", "overall", "inner", "outer"]
 class PersonPreprocessor:
     """Loads only the four detectors used to build cloth-agnostic masks."""
 
-    def __init__(self, util_model_path: str = "Models/Human-Toolkit", device: str = None):
+    def __init__(
+        self,
+        util_model_path: str = "Models/Human-Toolkit",
+        base_model_path: str = "Models/FastFit-MR-1024",
+        mixed_precision: str = "bf16",
+        device: str = None,
+    ):
         # Auto-download the utility models if missing (same as FastFitDemo).
         if not os.path.exists(util_model_path):
             os.makedirs(util_model_path, exist_ok=True)
@@ -69,8 +82,25 @@ class PersonPreprocessor:
                 local_dir=util_model_path,
                 local_dir_use_symlinks=False,
             )
+        # Auto-download only the VAE subfolder of the base model if missing.
+        if not os.path.exists(os.path.join(base_model_path, "vae")):
+            os.makedirs(base_model_path, exist_ok=True)
+            snapshot_download(
+                repo_id="zhengchong/FastFit-MR-1024",
+                local_dir=base_model_path,
+                local_dir_use_symlinks=False,
+                allow_patterns=["vae/*"],
+            )
 
         self.device = device if device is not None else "cuda" if torch.cuda.is_available() else "cpu"
+        # Resolve weight dtype exactly as FastFitPipeline does (pipeline_fastfit.py).
+        if mixed_precision == "fp16":
+            self.weight_dtype = torch.float16
+        elif mixed_precision == "bf16":
+            self.weight_dtype = torch.bfloat16
+        else:
+            self.weight_dtype = torch.float32
+
         # Mirrors app.py:209-213 — but no FastFitPipeline.
         self.dwpose_detector = DWposeDetector(
             pretrained_model_name_or_path=os.path.join(util_model_path, "DWPose"), device="cpu"
@@ -84,6 +114,9 @@ class PersonPreprocessor:
         self.schp_atr_detector = SCHP(
             ckpt_path=os.path.join(util_model_path, "SCHP", "schp-atr.pth"), device=self.device
         )
+        # VAE only — used to precompute the masked-person latent (no UNet).
+        self.vae = AutoencoderKL.from_pretrained(base_model_path, subfolder="vae")
+        self.vae.to(self.device, dtype=self.weight_dtype).eval()
 
     def process_one(self, image_path: Path, output_dir: Path) -> None:
         """Run detectors + generate all mask variants for a single image."""
@@ -115,6 +148,7 @@ class PersonPreprocessor:
         # 12 mask variants. NOTE: the *_square variants (and multi-ref
         # horizon_expand) involve randomness, so they are one fixed realization
         # rather than bit-reproducible. The 6 non-square variants are deterministic.
+        multiref_square = None
         for square in (False, True):
             suffix = "_square" if square else ""
             # Default whole-outfit mask (mask_part=None path, app.py:267-271).
@@ -123,6 +157,8 @@ class PersonPreprocessor:
                 square_cloth_mask=square, horizon_expand=True,
             )
             multiref.save(masks_out / f"multiref{suffix}.png")
+            if square:
+                multiref_square = multiref
 
             # Single-region masks (--mask-part path, app.py:262-266).
             for part in MASK_PARTS:
@@ -131,6 +167,46 @@ class PersonPreprocessor:
                     part=part, square_cloth_mask=square,
                 )
                 mask.save(masks_out / f"{part}{suffix}.png")
+
+        # VAE latents for the pose=True, square_cloth_mask=True configuration.
+        # Replicates pipeline_fastfit.py:145-177 but with .mode() (deterministic
+        # mean) instead of .sample(), and only the person-side tensors.
+        self._save_latents(img, multiref_square, pose_img, person_out)
+
+    def _save_latents(self, img, mask_img, pose_img, person_out: Path) -> None:
+        """Compute and persist masked_person_latent and mask_latent (bf16, CPU)."""
+        with torch.no_grad():
+            person_t = prepare_image(img, self.device, self.weight_dtype)
+            mask_t = prepare_mask_image(mask_img, self.device, self.weight_dtype)
+            pose_t = prepare_image(pose_img, self.device, self.weight_dtype, do_normalize=False)
+            # Pipeline's pose-size guard (pipeline_fastfit.py:150-156).
+            if pose_t.shape[-2:] != (img.size[1], img.size[0]):
+                pose_t = torch.nn.functional.interpolate(
+                    pose_t.unsqueeze(0),
+                    size=(img.size[1], img.size[0]),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+            masked_person = person_t * (1 - mask_t) + mask_t * pose_t
+
+            masked_person_latent = (
+                self.vae.encode(masked_person).latent_dist.mode()
+                * self.vae.config.scaling_factor
+            )
+            mask_latent = torch.nn.functional.interpolate(
+                mask_t.to(dtype=torch.float32),
+                size=masked_person_latent.shape[-2:],
+                mode="nearest",
+            ).to(self.weight_dtype)
+
+        torch.save(
+            masked_person_latent.to("cpu", torch.bfloat16),
+            person_out / "masked_person_latent_square_pose.pt",
+        )
+        torch.save(
+            mask_latent.to("cpu", torch.bfloat16),
+            person_out / "mask_latent_square.pt",
+        )
 
 
 def collect_images(input_path: Path) -> List[Path]:
@@ -155,6 +231,10 @@ def parse_args() -> argparse.Namespace:
                         help="Directory to write cached tensors and masks.")
     parser.add_argument("--util-model-path", default="Models/Human-Toolkit",
                         help="Local path for the Human-Toolkit utility models (auto-downloaded if missing).")
+    parser.add_argument("--base-model-path", default="Models/FastFit-MR-1024",
+                        help="Local path for the FastFit base model; only its vae/ subfolder is needed (auto-downloaded if missing).")
+    parser.add_argument("--mixed-precision", default="bf16", choices=["fp16", "bf16", "no"],
+                        help="VAE compute dtype (matches FastFitPipeline). Default bf16.")
     parser.add_argument("--device", default=None, help="Override device (e.g. cuda, cpu). Defaults to auto.")
     parser.add_argument("--overwrite", action="store_true",
                         help="Reprocess images whose output folder already exists.")
@@ -171,7 +251,12 @@ def main() -> None:
         print(f"[FAILED] No images found at {input_path}")
         raise SystemExit(1)
 
-    preprocessor = PersonPreprocessor(util_model_path=args.util_model_path, device=args.device)
+    preprocessor = PersonPreprocessor(
+        util_model_path=args.util_model_path,
+        base_model_path=args.base_model_path,
+        mixed_precision=args.mixed_precision,
+        device=args.device,
+    )
 
     n_ok = n_skip = n_fail = 0
     for image_path in images:
