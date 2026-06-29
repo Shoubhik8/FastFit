@@ -42,6 +42,7 @@ import argparse
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -520,19 +521,29 @@ def main() -> None:
     pipeline = build_pipeline(args, device)
 
     n_ok = n_fail = 0
+    durations = []  # per-combo wall-clock for the OK runs (for the avg summary)
     for combo in combos:
+        t0 = time.perf_counter()
         try:
             out = run_combo(pipeline, person_cache, get_cat_cache(combo["category"]),
                             combo, args, device)
-            print(f"[OK]   {combo['combo_id']} -> {out}")
+            dt = time.perf_counter() - t0
+            durations.append(dt)
+            print(f"[OK]   {combo['combo_id']} -> {out}  ({dt:.1f}s)")
             n_ok += 1
         except Exception as e:
-            print(f"[FAIL] {combo['combo_id']}: {e}")
+            dt = time.perf_counter() - t0
+            print(f"[FAIL] {combo['combo_id']}: {e}  ({dt:.1f}s)")
             n_fail += 1
 
+    timing = ""
+    if durations:
+        timing = (f" Per-combo: {sum(durations) / len(durations):.1f}s avg, "
+                  f"{min(durations):.1f}s min, {max(durations):.1f}s max "
+                  f"(total {sum(durations):.1f}s).")
     print(f"\nDone. {n_ok} ok, {n_fail} failed"
           + (f", {len(skipped)} skipped" if skipped else "")
-          + f". Outputs in {args.output_dir}")
+          + f". Outputs in {args.output_dir}." + timing)
     if n_fail and not n_ok:
         raise SystemExit(1)
 

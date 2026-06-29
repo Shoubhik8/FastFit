@@ -216,6 +216,8 @@ test*
 
 # macOS
 .DS_Store
+__MACOSX/
 
 # Large local archives (kept on disk, not in git)
 inventory.zip
+inventory/

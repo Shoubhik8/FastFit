@@ -52,7 +52,7 @@ import numpy as np
 import torch
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from huggingface_hub import snapshot_download
-from PIL import Image
+from PIL import Image, ImageOps
 
 from app import PERSON_SIZE, center_crop_to_aspect_ratio
 from module.utils import prepare_image, prepare_mask_image
@@ -136,7 +136,11 @@ class PersonPreprocessor:
         masks_out.mkdir(parents=True, exist_ok=True)
 
         # Same person transform as FastFitDemo.preprocess_person_image (app.py:242-244).
-        img = Image.open(image_path).convert("RGB")
+        # Honor EXIF orientation FIRST: phone photos often store pixels sideways with
+        # an Orientation tag that viewers apply but PIL.open does not. Skipping this
+        # would feed a rotated frame into the 3:4 crop and every detector. No-op when
+        # the tag is absent (e.g. sumant), so existing caches are unaffected.
+        img = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
         img = center_crop_to_aspect_ratio(img, 3 / 4)
         img = img.resize(PERSON_SIZE, Image.LANCZOS)
         img.save(person_out / "person.png")
