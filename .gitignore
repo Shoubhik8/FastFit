@@ -213,3 +213,9 @@ Models
 Datasets
 results
 test*
+
+# macOS
+.DS_Store
+
+# Large local archives (kept on disk, not in git)
+inventory.zip

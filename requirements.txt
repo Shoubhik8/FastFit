@@ -15,6 +15,7 @@ pycocotools
 av
 huggingface-hub
 pillow
+pillow-avif-plugin  # registers an AVIF opener; inventory garments are mostly .avif
 onnxruntime
 omegaconf
 einops

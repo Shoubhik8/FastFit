@@ -105,10 +105,12 @@ class FastFitPipeline:
         eta: float = 1.0,
         return_pil: bool = True,
         do_adjust_input_image: bool = False,
+        masked_person_latent: Optional[torch.Tensor] = None,
+        mask_latent: Optional[torch.Tensor] = None,
     ):
         """
         Execute FastFit inference
-        
+
         Args:
             person: Input person image
             mask: Mask image
@@ -123,6 +125,12 @@ class FastFitPipeline:
             eta: Eta parameter
             return_pil: Whether to return PIL image
             adjust_input_image: Whether to adjust the input image
+            masked_person_latent: Optional precomputed masked-person VAE latent
+                (1, 4, H/8, W/8). When supplied together with `mask_latent`, the
+                pose blend and `vae.encode(masked_person)` are skipped (the person
+                side is already encoded — see precompute_person_preprocessing.py).
+            mask_latent: Optional precomputed mask latent (1, 1, H/8, W/8) matching
+                `masked_person_latent`. Both must be provided to take the fast path.
         Returns:
             Generated image
         """
@@ -141,21 +149,19 @@ class FastFitPipeline:
         if isinstance(ref_labels[0], str):
             ref_labels = [REF_LABEL_MAP[label] for label in ref_labels]
         
-        # Convert to tensors
+        # Convert to tensors. person + mask are always needed at full resolution
+        # for the final repaint (`image = image * mask + (1 - mask) * person`),
+        # regardless of whether the person-side latents are precomputed.
         person = prepare_image(person_img, self.device, self.weight_dtype)
         mask = prepare_mask_image(mask_img, self.device, self.weight_dtype)
         ref_images = [prepare_image(image, self.device, self.weight_dtype) for image in ref_images]
-        if pose is not None:
-            pose = prepare_image(pose, self.device, self.weight_dtype, do_normalize=False)
-            if pose.shape[-2:] != (person_img.size[1], person_img.size[0]):
-                pose = torch.nn.functional.interpolate(
-                    pose.unsqueeze(0),
-                    size=(person_img.size[1], person_img.size[0]),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0)
-        masked_person = person * (1 - mask) + mask * pose if pose is not None else person * (1 - mask)
-        
+
+        # Fast path: consume precomputed person-side latents. These come from
+        # precompute_person_preprocessing.py (`.latent_dist.mode()`, deterministic)
+        # rather than the live `.sample()` below — by design, not a bug. A bf16->fp16
+        # cast here is lossy but valid when running with --mixed-precision fp16.
+        use_precomputed = masked_person_latent is not None and mask_latent is not None
+
         if ref_attention_masks is not None:
             if isinstance(ref_attention_masks[0], int):
                 ref_attention_masks = [torch.tensor([ref_attn_mask]).to(self.device) for ref_attn_mask in ref_attention_masks]
@@ -166,16 +172,31 @@ class FastFitPipeline:
                 ref_labels = [torch.tensor([ref_label]).to(self.device) for ref_label in ref_labels]
             else:
                 ref_labels = [ref_label.to(self.device) for ref_label in ref_labels]
-        
+
         # Compute latent representations
-        masked_person_latent = self.vae.encode(masked_person).latent_dist.sample() * self.vae.config.scaling_factor
+        if use_precomputed:
+            masked_person_latent = masked_person_latent.to(self.device, self.weight_dtype)
+            mask_latent = mask_latent.to(self.device, self.weight_dtype)
+        else:
+            if pose is not None:
+                pose = prepare_image(pose, self.device, self.weight_dtype, do_normalize=False)
+                if pose.shape[-2:] != (person_img.size[1], person_img.size[0]):
+                    pose = torch.nn.functional.interpolate(
+                        pose.unsqueeze(0),
+                        size=(person_img.size[1], person_img.size[0]),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+            masked_person = person * (1 - mask) + mask * pose if pose is not None else person * (1 - mask)
+            masked_person_latent = self.vae.encode(masked_person).latent_dist.sample() * self.vae.config.scaling_factor
+            mask_latent = torch.nn.functional.interpolate(
+                mask.to(dtype=torch.float32),
+                size=masked_person_latent.shape[-2:],
+                mode="nearest",
+            ).to(self.weight_dtype)
+
         ref_images_latent = [self.vae.encode(image).latent_dist.sample() * self.vae.config.scaling_factor for image in ref_images]
-        mask_latent = torch.nn.functional.interpolate(
-            mask.to(dtype=torch.float32),
-            size=masked_person_latent.shape[-2:],
-            mode="nearest",
-        ).to(self.weight_dtype)
-        
+
         # Prepare noise & timesteps
         noise = randn_tensor(
             masked_person_latent.shape,
